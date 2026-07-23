@@ -1,0 +1,12 @@
+services:
+  rag-app:
+    build: .
+    container_name: rag-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
