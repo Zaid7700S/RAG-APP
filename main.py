@@ -211,7 +211,11 @@ async def chat_endpoint(request: ChatRequest):
     if history and request.mode.strip() != "General":
         try:
             rewrite_prompt = ChatPromptTemplate.from_template(
-                "Given the chat history, rewrite the user's latest query to be a standalone question. If it is already standalone, return it exactly as is. DO NOT answer it.\n\nHistory:\n{history}\n\nLatest Query: {query}"
+                "You are a strict search query optimizer. Look at the chat history and the user's latest query.\n"
+                "1. If the latest query uses pronouns (it, they, this, he, she) or explicitly refers to something in the previous message, rewrite it into a standalone search query.\n"
+                "2. HOWEVER, if the latest query is already clear and standalone, OR if it is identical to a previous question, you MUST return the latest query exactly word-for-word without changing a single letter.\n"
+                "DO NOT answer the question. ONLY output the search query.\n\n"
+                "History:\n{history}\n\nLatest Query: {query}"
             )
             search_query = (rewrite_prompt | fast_llm | StrOutputParser()).invoke({
                 "history": "\n".join(history_text_blocks[-4:]),
