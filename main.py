@@ -67,7 +67,7 @@ def get_embeddings(google_api_key: str):
         raise HTTPException(status_code=401, detail="Google API Key is required for embeddings.")
     try:
         return GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004", 
+            model="models/gemini-embedding-001", 
             google_api_key=google_api_key
         )
     except Exception as e:
