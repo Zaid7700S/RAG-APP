@@ -286,7 +286,7 @@ async def chat_endpoint(request: ChatRequest):
                     q_vector = cached_embed_query(q, request.hf_api_key)
                     hybrid_res = supabase_client.rpc(
                         "hybrid_search",
-                        {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
+                        {"query_text": q, "query_embedding": q_vector, "match_count": 15, "filter": target_filter}
                     ).execute()
                     
                     for r in hybrid_res.data:
@@ -294,7 +294,7 @@ async def chat_endpoint(request: ChatRequest):
                             seen_content.add(r["content"])
                             all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
                 
-                best_docs_scored = cross_encode_rerank(search_query, all_raw_docs, request.hf_api_key, top_k=3)
+                best_docs_scored = cross_encode_rerank(search_query, all_raw_docs, request.hf_api_key, top_k=8)
                 max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
                 CONFIDENCE_THRESHOLD = -8.0
 
@@ -316,11 +316,15 @@ async def chat_endpoint(request: ChatRequest):
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
                     context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
+                    # REPLACED SYSTEM PROMPT
                     system_prompt = (
                         "You are an expert document analysis assistant. Answer the user's query using ONLY the provided context below. "
-                        "Assume the user is the owner/subject of the documents. If the context contains Markdown tables, numbers, or academic grades, intelligently extract them to best answer the query.\n\n"
+                        "Assume the user is the owner/subject of the documents. "
+                        "If the user asks a broad question (like 'what are my marks' or 'summarize'), provide a comprehensive breakdown of all relevant data found in the context. "
+                        "If you only have partial data, provide what you have and explicitly state that it is a partial view based on the context. "
+                        "If the context contains Markdown tables, numbers, or academic grades, intelligently extract and format them.\n\n"
                         f"Context:\n{context_text}\n\n"
-                        "If the answer cannot be reasonably found in the context, output exactly: 'I cannot answer this from the documents.'"
+                        "If absolutely NO relevant information can be found in the context to even partially answer the user, output exactly: 'I cannot answer this from the documents.'"
                     )
                     
                     messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
