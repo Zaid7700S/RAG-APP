@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client, Client
 from langchain_groq import ChatGroq
@@ -26,7 +26,6 @@ load_dotenv()
 
 # --- FIX: OVERRIDE BROKEN LANGCHAIN SUPABASE SEARCH METHODS ---
 def _patched_similarity_search_by_vector(self, embedding: list, k: int = 4, filter: dict = None, **kwargs):
-    """Bypass broken LangChain params attribute bug and query Supabase RPC directly."""
     client = getattr(self, "client", None) or getattr(self, "_client", None)
     query_name = getattr(self, "query_name", "match_documents")
     
@@ -62,21 +61,26 @@ SupabaseVectorStore.similarity_search = _patched_similarity_search
 # --- STATE MANAGEMENT & LAZY LOADING ---
 chat_sessions = {}
 supabase_client: Client = None
-embeddings = None
 
-def get_embeddings():
-    global embeddings
-    if embeddings is None:
-        embeddings = FastEmbedEmbeddings()
-    return embeddings
+def get_embeddings(google_api_key: str):
+    if not google_api_key:
+        raise HTTPException(status_code=401, detail="Google API Key is required for embeddings.")
+    try:
+        return GoogleGenerativeAIEmbeddings(
+            model="models/text-embedding-004", 
+            google_api_key=google_api_key
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google API Key: {str(e)}")
 
-def get_vector_store():
+
+def get_vector_store(google_api_key: str):
     global supabase_client
     if supabase_client is None:
         raise HTTPException(status_code=500, detail="Supabase client not initialized")
     return SupabaseVectorStore(
         client=supabase_client,
-        embedding=get_embeddings(),
+        embedding=get_embeddings(google_api_key),
         table_name="documents",
         query_name="match_documents"
     )
@@ -98,7 +102,6 @@ app = FastAPI(title="RAG API Engine", lifespan=lifespan)
 
 
 # --- GLOBAL EXCEPTION HANDLER ---
-# Forces valid CORS headers on exceptions to prevent "fake CORS" errors in frontend
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     print(f"CRASH LOG: {traceback.format_exc()}")
@@ -116,7 +119,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # --- CORS CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Change this to allow all incoming cloud requests
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,6 +131,7 @@ class ChatRequest(BaseModel):
     session_id: str
     query: str
     api_key: str          
+    google_api_key: str
     mode: str = "Auto"    
 
 class ChatResponse(BaseModel):
@@ -139,16 +143,23 @@ class ChatResponse(BaseModel):
 # --- ENDPOINTS ---
 
 @app.post("/upload/")
-async def upload_document(file: UploadFile = File(...), user_id: str = Form(...)):
+async def upload_document(
+    file: UploadFile = File(...), 
+    user_id: str = Form(...),
+    google_api_key: str = Form(...)
+):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
     if not user_id or user_id == "undefined":
         raise HTTPException(status_code=401, detail="Invalid user session. Please log in again.")
+    
+    if not google_api_key:
+        raise HTTPException(status_code=401, detail="Google API Key is required to process documents.")
 
     print(f"📥 UPLOADING FILE: '{file.filename}' FOR USER: {user_id}")
 
-    vector_store = get_vector_store()
+    vector_store = get_vector_store(google_api_key)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_file_path = os.path.join(tmp_dir, file.filename)
@@ -171,7 +182,7 @@ async def upload_document(file: UploadFile = File(...), user_id: str = Form(...)
             split.metadata["file_name"] = file.filename
         
         # --- BATCH PROCESSING LOGIC (Prevents 512MB RAM Overflows) ---
-        BATCH_SIZE = 15  # Process 15 chunks at a time
+        BATCH_SIZE = 15  
         total_chunks = len(splits)
         print(f"📦 Total Chunks: {total_chunks}. Processing in batches of {BATCH_SIZE}...")
 
@@ -205,13 +216,13 @@ async def chat_endpoint(request: ChatRequest):
     try:
         main_llm = ChatGroq(
             model_name="llama-3.3-70b-versatile", 
-            temperature=0.0, # Lowered to 0 for stricter adherence
+            temperature=0.0, 
             api_key=request.api_key
         )
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid API Key provided.")
+        raise HTTPException(status_code=401, detail="Invalid Groq API Key provided.")
     
-    vector_store = get_vector_store()
+    vector_store = get_vector_store(request.google_api_key)
 
     # --- SMART INTENT ROUTING ---
     selected_mode = request.mode.strip()
