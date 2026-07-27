@@ -347,12 +347,34 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/api/documents/{user_id}")
 async def get_user_documents(user_id: str):
-    """Fetches all documents uploaded by a specific user."""
+    """Fetches all documents, including older ones uploaded before summarization."""
     if supabase_client is None: 
         raise HTTPException(status_code=500, detail="Database not configured")
     try:
-        res = supabase_client.table("document_summaries").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-        return {"status": "success", "documents": res.data}
+        # 1. Fetch newer documents with rich summaries
+        summary_res = supabase_client.table("document_summaries").select("*").eq("user_id", user_id).execute()
+        summaries = {doc["file_name"]: doc for doc in summary_res.data}
+
+        # 2. Fetch all unique files from raw vector chunks to catch older uploads
+        chunk_res = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": user_id}).execute()
+
+        final_docs = {}
+        for row in chunk_res.data:
+            fname = row["metadata"].get("file_name")
+            if fname and fname not in final_docs:
+                if fname in summaries:
+                    final_docs[fname] = summaries[fname]
+                else:
+                    # Fallback for old documents
+                    final_docs[fname] = {
+                        "id": fname,
+                        "file_name": fname,
+                        "title": fname,
+                        "summary": "Active in vector knowledge base (Uploaded before automated summaries were enabled).",
+                        "created_at": row["metadata"].get("upload_date", "Unknown")
+                    }
+
+        return {"status": "success", "documents": list(final_docs.values())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
