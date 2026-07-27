@@ -25,7 +25,6 @@ from langchain_core.documents import Document
 
 load_dotenv()
 
-# --- STATE MANAGEMENT & LAZY LOADING ---
 supabase_client: Client = None
 
 def get_embeddings(hf_api_key: str):
@@ -47,7 +46,7 @@ async def lifespan(app: FastAPI):
         print("Connected to Supabase successfully!")
     yield
 
-app = FastAPI(title="RAG API Engine v3", lifespan=lifespan)
+app = FastAPI(title="RAG API Engine v4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,21 +75,15 @@ class ChatRequest(BaseModel):
 
 
 def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, top_k: int = 3):
-    """Uses Hugging Face API to rerank chunks and returns a tuple of (Document, Score)."""
     if not documents: return []
-    
     API_URL = "https://api-inference.huggingface.co/models/cross-encoder/ms-marco-MiniLM-L-6-v2"
     headers = {"Authorization": f"Bearer {hf_api_key}"}
     pairs = [{"text": query, "text_pair": doc.page_content} for doc in documents]
-    
     try:
         response = requests.post(API_URL, headers=headers, json={"inputs": pairs})
         scores = response.json()
-        
         if not isinstance(scores, list) or "error" in scores:
-            # Fallback pseudo-scores if API is cold
-            return [(doc, float(doc.metadata.get("similarity", 0.1))) for doc in documents[:top_k]]
-            
+            return [(doc, 0.1) for doc in documents[:top_k]]
         scored_docs = list(zip(documents, scores))
         scored_docs.sort(key=lambda x: x[1], reverse=True)
         return scored_docs[:top_k]
@@ -98,8 +91,8 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
         return [(doc, 0.1) for doc in documents[:top_k]]
 
 
-# --- PRIORITY 8: BACKGROUND PROCESSING WORKER ---
-def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str):
+# --- PRIORITY 8 & 11: BACKGROUND PROCESSING & AUTO-SUMMARIZATION ---
+def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
     try:
         vector_store = SupabaseVectorStore(
             client=supabase_client, embedding=get_embeddings(hf_api_key),
@@ -109,6 +102,26 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         loader = PyPDFLoader(tmp_file_path)
         docs = loader.load()
         
+        # Priority 11: Generate Title & Summary from first few pages
+        preview_text = " ".join([d.page_content for d in docs[:3]])[:4000]
+        try:
+            summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
+            sum_prompt = ChatPromptTemplate.from_template("Analyze text and output JSON with keys 'title', 'summary', and 'keywords' (array).\nText: {text}")
+            res = (sum_prompt | summary_llm | StrOutputParser()).invoke({"text": preview_text})
+            # Clean JSON formatting
+            clean_res = res.replace("```json", "").replace("```", "").strip()
+            parsed_summary = json.loads(clean_res)
+            
+            supabase_client.table("document_summaries").insert({
+                "user_id": str(user_id),
+                "file_name": file_name,
+                "title": parsed_summary.get("title", file_name),
+                "summary": parsed_summary.get("summary", "No summary available."),
+                "keywords": parsed_summary.get("keywords", [])
+            }).execute()
+        except Exception as e:
+            print(f"⚠️ Auto-summary generation skipped: {e}")
+
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150, separators=["\n\n", "\n", ". ", " ", ""])
         splits = text_splitter.split_documents(docs)
         del docs
@@ -127,8 +140,10 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             vector_store.add_documents(batch)
             del batch
             gc.collect()
+
+        del splits
+        gc.collect()
             
-        print(f"✅ Background processing complete for {file_name}")
     except Exception as e:
         print(f"❌ Background processing failed for {file_name}: {str(e)}")
     finally:
@@ -141,20 +156,19 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...), 
     user_id: str = Form(...),
-    hf_api_key: str = Form(...)
+    hf_api_key: str = Form(...),
+    groq_api_key: str = Form(...) # Added to support auto-summarization LLM calls
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    # Save to a persistent temporary file before passing to background worker
     fd, tmp_file_path = tempfile.mkstemp(suffix=".pdf")
     with os.fdopen(fd, "wb") as f:
         f.write(await file.read())
         
-    # Send heavy lifting to background
-    background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key)
+    background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key, groq_api_key)
             
-    return {"status": "processing", "message": f"Document '{file.filename}' is being processed in the background."}
+    return {"status": "processing", "message": f"Document '{file.filename}' queued for background processing."}
 
 
 @app.post("/chat/")
@@ -186,30 +200,59 @@ async def chat_endpoint(request: ChatRequest):
         
         if intent == "RAG":
             embeddings = get_embeddings(request.hf_api_key)
-            query_vector = embeddings.embed_query(request.query)
             
-            hybrid_res = supabase_client.rpc(
-                "hybrid_search",
-                {"query_text": request.query, "query_embedding": query_vector, "match_count": 10, "filter": {"user_id": str(request.user_id)}}
-            ).execute()
+            # PRIORITY 12: Intelligent Document Selection (Targeted Scoping)
+            user_docs = supabase_client.table("documents").select("metadata").eq("metadata->>user_id", request.user_id).execute()
+            available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
             
-            # Carry over hybrid similarity score into metadata
-            raw_docs = [Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}) for r in hybrid_res.data]
+            target_filter = {"user_id": str(request.user_id)}
+            if available_files:
+                try:
+                    selector_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=request.api_key)
+                    sel_prompt = ChatPromptTemplate.from_template("Given the user query and available files, select the single exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
+                    selected_file = (sel_prompt | selector_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": request.query}).strip()
+                    if selected_file in available_files:
+                        target_filter["file_name"] = selected_file
+                except Exception: pass
+
+            # PRIORITY 13: Multi-Query Retrieval Expansion
+            queries = [request.query]
+            try:
+                expander_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, api_key=request.api_key)
+                exp_prompt = ChatPromptTemplate.from_template("Generate 2 alternative variations of this search query for vector retrieval. Return as a comma-separated list.\nQuery: {query}")
+                alt_queries = (exp_prompt | expander_llm | StrOutputParser()).invoke({"query": request.query}).split(",")
+                queries.extend([q.strip() for q in alt_queries if q.strip()])
+            except Exception: pass
+
+            # Aggregate and merge chunks across all query variations
+            all_raw_docs = []
+            seen_content = set()
             
-            best_docs_scored = cross_encode_rerank(request.query, raw_docs, request.hf_api_key, top_k=3)
+            for q in queries:
+                q_vector = embeddings.embed_query(q)
+                hybrid_res = supabase_client.rpc(
+                    "hybrid_search",
+                    {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
+                ).execute()
+                
+                for r in hybrid_res.data:
+                    if r["content"] not in seen_content:
+                        seen_content.add(r["content"])
+                        all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
             
-            # PRIORITY 10: Confidence Threshold Check
+            best_docs_scored = cross_encode_rerank(request.query, all_raw_docs, request.hf_api_key, top_k=3)
+            
+            # PRIORITY 10: Confidence Check
             max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
-            CONFIDENCE_THRESHOLD = -5.0 # Cross-encoders can output negative logits, adjust this based on testing
+            CONFIDENCE_THRESHOLD = -5.0
 
             if not best_docs_scored or max_confidence < CONFIDENCE_THRESHOLD:
                 yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
-                msg = "I could not confidently answer from your uploaded documents (Confidence score too low). Please rephrase or upload a relevant document."
+                msg = "I could not confidently answer from your uploaded documents."
                 for word in msg.split():
                     yield json.dumps({"type": "token", "content": word + " "}) + "\n"
                 return
             
-            # PRIORITY 9: Rich Citations Integration
             for doc, score in best_docs_scored:
                 sources_data.append({
                     "source": doc.metadata.get('file_name', 'Unknown'),
