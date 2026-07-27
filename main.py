@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client, Client
 from langchain_groq import ChatGroq
@@ -62,25 +62,26 @@ SupabaseVectorStore.similarity_search = _patched_similarity_search
 chat_sessions = {}
 supabase_client: Client = None
 
-def get_embeddings(google_api_key: str):
-    if not google_api_key:
-        raise HTTPException(status_code=401, detail="Google API Key is required for embeddings.")
+def get_embeddings(hf_api_key: str):
+    if not hf_api_key:
+        raise HTTPException(status_code=401, detail="Hugging Face API Key is required for embeddings.")
     try:
-        return GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001", 
-            google_api_key=google_api_key
+        return HuggingFaceEndpointEmbeddings(
+            model="sentence-transformers/all-MiniLM-L6-v2",
+            task="feature-extraction",
+            huggingfacehub_api_token=hf_api_key
         )
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid Google API Key: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid Hugging Face API Key: {str(e)}")
 
 
-def get_vector_store(google_api_key: str):
+def get_vector_store(hf_api_key: str):
     global supabase_client
     if supabase_client is None:
         raise HTTPException(status_code=500, detail="Supabase client not initialized")
     return SupabaseVectorStore(
         client=supabase_client,
-        embedding=get_embeddings(google_api_key),
+        embedding=get_embeddings(hf_api_key),
         table_name="documents",
         query_name="match_documents"
     )
@@ -131,7 +132,7 @@ class ChatRequest(BaseModel):
     session_id: str
     query: str
     api_key: str          
-    google_api_key: str
+    hf_api_key: str
     mode: str = "Auto"    
 
 class ChatResponse(BaseModel):
@@ -146,7 +147,7 @@ class ChatResponse(BaseModel):
 async def upload_document(
     file: UploadFile = File(...), 
     user_id: str = Form(...),
-    google_api_key: str = Form(...)
+    hf_api_key: str = Form(...)
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -154,12 +155,12 @@ async def upload_document(
     if not user_id or user_id == "undefined":
         raise HTTPException(status_code=401, detail="Invalid user session. Please log in again.")
     
-    if not google_api_key:
-        raise HTTPException(status_code=401, detail="Google API Key is required to process documents.")
+    if not hf_api_key:
+        raise HTTPException(status_code=401, detail="Hugging Face API Key is required to process documents.")
 
     print(f"📥 UPLOADING FILE: '{file.filename}' FOR USER: {user_id}")
 
-    vector_store = get_vector_store(google_api_key)
+    vector_store = get_vector_store(hf_api_key)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_file_path = os.path.join(tmp_dir, file.filename)
@@ -222,7 +223,7 @@ async def chat_endpoint(request: ChatRequest):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid Groq API Key provided.")
     
-    vector_store = get_vector_store(request.google_api_key)
+    vector_store = get_vector_store(request.hf_api_key)
 
     # --- SMART INTENT ROUTING ---
     selected_mode = request.mode.strip()
