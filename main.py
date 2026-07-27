@@ -28,6 +28,7 @@ load_dotenv()
 
 supabase_client: Client = None
 
+# Caching for Embeddings
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
 
 def get_embeddings(hf_api_key: str):
@@ -58,7 +59,7 @@ async def lifespan(app: FastAPI):
         print("Connected to Supabase successfully!")
     yield
 
-app = FastAPI(title="RAG API Engine v6 - Advanced Parsing", lifespan=lifespan)
+app = FastAPI(title="RAG API Engine v8 - Dynamic Scoping", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,7 +84,9 @@ class ChatRequest(BaseModel):
     query: str
     api_key: str          
     hf_api_key: str
-    mode: str = "Auto"    
+    mode: str = "Auto"
+    active_files: list = [] 
+    search_all_files: bool = False  # The new scope toggle flag
 
 def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, top_k: int = 3):
     if not documents: return []
@@ -101,7 +104,6 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
     except Exception:
         return [(doc, 0.1) for doc in documents[:top_k]]
 
-
 def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
     try:
         vector_store = SupabaseVectorStore(
@@ -109,18 +111,9 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             table_name="documents", query_name="hybrid_search"
         )
         
-        # PRIORITIES 19 & 20: Advanced Layout Parsing & OCR to Markdown
-        print(f"📄 Parsing layout of {file_name}...")
         md_pages = pymupdf4llm.to_markdown(tmp_file_path, page_chunks=True)
+        docs = [Document(page_content=p["text"], metadata={"page": p.get("metadata", {}).get("page", 1)}) for p in md_pages]
         
-        docs = []
-        for page in md_pages:
-            docs.append(Document(
-                page_content=page["text"],
-                metadata={"page": page.get("metadata", {}).get("page", 1)}
-            ))
-        
-        # Summarization step based on parsed Markdown
         preview_text = " ".join([d.page_content for d in docs[:3]])[:4000]
         try:
             summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
@@ -137,15 +130,9 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
                 "keywords": parsed_summary.get("keywords", [])
             }).execute()
         except Exception as e:
-            print(f"⚠️ Auto-summary generation skipped: {e}")
+            print(f"⚠️ Auto-summary skipped: {e}")
 
-        # PRIORITY 20: Markdown-Aware Splitting
-        # We prioritize splitting at headers (##) and paragraphs (\n\n) so tables are never split in half
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1200, 
-            chunk_overlap=200, 
-            separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""]
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200, separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""])
         splits = text_splitter.split_documents(docs)
         del docs
         gc.collect()
@@ -166,14 +153,12 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
 
         del splits
         gc.collect()
-        print(f"✅ Background processing complete for {file_name}")
             
     except Exception as e:
         print(f"❌ Background processing failed for {file_name}: {str(e)}")
     finally:
         if os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
-
 
 @app.post("/upload/")
 async def upload_document(
@@ -199,7 +184,6 @@ async def upload_document(
         f.write(await file.read())
         
     background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key, groq_api_key)
-            
     return {"status": "processing", "message": f"Document '{file.filename}' queued for advanced layout parsing."}
 
 
@@ -207,8 +191,8 @@ async def upload_document(
 async def chat_endpoint(request: ChatRequest):
     db_history = supabase_client.table("chat_message_history").select("*").eq("session_id", request.session_id).order("created_at").execute()
     history = []
-    
     history_text_blocks = []
+    
     for row in db_history.data:
         if row["role"] == "user": 
             history.append(HumanMessage(content=row["content"]))
@@ -233,8 +217,7 @@ async def chat_endpoint(request: ChatRequest):
                 "history": "\n".join(history_text_blocks[-4:]),
                 "query": request.query
             }).strip()
-        except Exception as e:
-            print(f"Rewriter error: {e}")
+        except Exception: pass
 
     intent = "GENERAL"
     if request.mode.strip() == "RAG": intent = "RAG"
@@ -251,17 +234,39 @@ async def chat_endpoint(request: ChatRequest):
         
         try:
             if intent == "RAG":
-                user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
-                available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
-                
                 target_filter = {"user_id": str(request.user_id)}
-                if available_files:
-                    try:
-                        sel_prompt = ChatPromptTemplate.from_template("Given the user query and available files, select the single exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
-                        selected_file = (sel_prompt | fast_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": search_query}).strip()
-                        if selected_file in available_files:
-                            target_filter["file_name"] = selected_file
-                    except Exception: pass
+                
+                # --- NEW: DYNAMIC SCOPE CONTROL ---
+                if request.search_all_files:
+                    # Global Scope: Search everything the user has ever uploaded
+                    user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
+                    available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
+                    
+                    if available_files:
+                        try:
+                            sel_prompt = ChatPromptTemplate.from_template("Given the query and files, select the exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
+                            selected_file = (sel_prompt | fast_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": search_query}).strip()
+                            if selected_file in available_files:
+                                target_filter["file_name"] = selected_file
+                        except Exception: pass
+                else:
+                    # Session Scope: Restrict ONLY to files actively attached in this chat
+                    if request.active_files:
+                        if len(request.active_files) == 1:
+                            target_filter["file_name"] = request.active_files[0]
+                        else:
+                            try:
+                                sel_prompt = ChatPromptTemplate.from_template("Given the query and files, select the exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
+                                selected_file = (sel_prompt | fast_llm | StrOutputParser()).invoke({"files": json.dumps(request.active_files), "query": search_query}).strip()
+                                if selected_file in request.active_files:
+                                    target_filter["file_name"] = selected_file
+                            except Exception: pass
+                    else:
+                        yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
+                        msg = "There are no documents attached to this session. Please upload a file or switch your scope to 'All Files'."
+                        for word in msg.split():
+                            yield json.dumps({"type": "token", "content": word + " "}) + "\n"
+                        return
 
                 queries = [search_query]
                 try:
@@ -275,7 +280,6 @@ async def chat_endpoint(request: ChatRequest):
                 
                 for q in queries:
                     q_vector = cached_embed_query(q, request.hf_api_key)
-                    
                     hybrid_res = supabase_client.rpc(
                         "hybrid_search",
                         {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
@@ -287,13 +291,12 @@ async def chat_endpoint(request: ChatRequest):
                             all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
                 
                 best_docs_scored = cross_encode_rerank(search_query, all_raw_docs, request.hf_api_key, top_k=3)
-                
                 max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
                 CONFIDENCE_THRESHOLD = -8.0
 
                 if not best_docs_scored or max_confidence < CONFIDENCE_THRESHOLD:
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
-                    msg = "I could not confidently answer from your uploaded documents. Please ensure they contain the relevant information."
+                    msg = "I could not confidently answer from the selected document scope."
                     for word in msg.split():
                         yield json.dumps({"type": "token", "content": word + " "}) + "\n"
                         final_answer_accumulator += word + " "
@@ -308,12 +311,10 @@ async def chat_endpoint(request: ChatRequest):
                         })
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
-                    
                     context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
                     system_prompt = f"You are a strict document assistant. Answer ONLY using this context:\n{context_text}\nIf not in context, say 'I cannot answer this from the documents.'"
                     
                     messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
-                    
                     for chunk in main_llm.stream(messages):
                         token = chunk.content
                         final_answer_accumulator += token
@@ -322,7 +323,6 @@ async def chat_endpoint(request: ChatRequest):
             else:
                 yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
                 messages = [SystemMessage(content="You are a helpful AI assistant.")] + history + [HumanMessage(content=request.query)]
-                
                 for chunk in main_llm.stream(messages):
                     token = chunk.content
                     final_answer_accumulator += token
@@ -343,50 +343,30 @@ async def chat_endpoint(request: ChatRequest):
                 ]).execute()
 
     return StreamingResponse(generate_chat_stream(), media_type="application/x-ndjson")
-# --- PRIORITY 18: FRONTEND UI SUPPORT ENDPOINTS ---
 
 @app.get("/api/documents/{user_id}")
 async def get_user_documents(user_id: str):
-    """Fetches all documents, including older ones uploaded before summarization."""
-    if supabase_client is None: 
-        raise HTTPException(status_code=500, detail="Database not configured")
+    if supabase_client is None: raise HTTPException(status_code=500, detail="Database not configured")
     try:
-        # 1. Fetch newer documents with rich summaries
         summary_res = supabase_client.table("document_summaries").select("*").eq("user_id", user_id).execute()
         summaries = {doc["file_name"]: doc for doc in summary_res.data}
-
-        # 2. Fetch all unique files from raw vector chunks to catch older uploads
         chunk_res = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": user_id}).execute()
 
         final_docs = {}
         for row in chunk_res.data:
             fname = row["metadata"].get("file_name")
             if fname and fname not in final_docs:
-                if fname in summaries:
-                    final_docs[fname] = summaries[fname]
-                else:
-                    # Fallback for old documents
-                    final_docs[fname] = {
-                        "id": fname,
-                        "file_name": fname,
-                        "title": fname,
-                        "summary": "Active in vector knowledge base (Uploaded before automated summaries were enabled).",
-                        "created_at": row["metadata"].get("upload_date", "Unknown")
-                    }
-
+                if fname in summaries: final_docs[fname] = summaries[fname]
+                else: final_docs[fname] = {"id": fname, "file_name": fname, "title": fname, "summary": "Active in vector knowledge base.", "created_at": row["metadata"].get("upload_date", "Unknown")}
         return {"status": "success", "documents": list(final_docs.values())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/documents/{user_id}/{file_name}")
 async def delete_user_document(user_id: str, file_name: str):
-    """Deletes a document from both the vector store and the summary table."""
-    if supabase_client is None: 
-        raise HTTPException(status_code=500, detail="Database not configured")
+    if supabase_client is None: raise HTTPException(status_code=500, detail="Database not configured")
     try:
-        # Delete raw chunks from vector store using JSONB containment filter
         supabase_client.table("documents").delete().contains("metadata", {"user_id": user_id, "file_name": file_name}).execute()
-        # Delete metadata from summaries
         supabase_client.table("document_summaries").delete().eq("user_id", user_id).eq("file_name", file_name).execute()
         return {"status": "success", "message": f"Deleted {file_name}"}
     except Exception as e:
@@ -394,22 +374,12 @@ async def delete_user_document(user_id: str, file_name: str):
 
 @app.put("/api/sessions/{session_id}")
 async def rename_session(session_id: str, request: Request):
-    """Allows users to rename their chat history sidebar items."""
-    if supabase_client is None: 
-        raise HTTPException(status_code=500, detail="Database not configured")
+    if supabase_client is None: raise HTTPException(status_code=500, detail="Database not configured")
     try:
         body = await request.json()
         new_title = body.get("title")
-        if not new_title:
-            raise HTTPException(status_code=400, detail="Title is required")
-            
+        if not new_title: raise HTTPException(status_code=400, detail="Title is required")
         supabase_client.table("workspace_sessions").update({"title": new_title}).eq("id", session_id).execute()
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/db/explore/")
-async def explore_database(limit: int = 5):
-    if supabase_client is None: return {"status": "error", "message": "Supabase not configured"}
-    response = supabase_client.table("documents").select("id, content, metadata").limit(limit).execute()
-    return {"status": "success", "data": response.data}
