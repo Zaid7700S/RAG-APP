@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from cachetools import TTLCache
 
-from langchain_community.document_loaders import PyPDFLoader
+import pymupdf4llm
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
@@ -27,6 +28,8 @@ load_dotenv()
 
 supabase_client: Client = None
 
+embedding_cache = TTLCache(maxsize=1000, ttl=3600)
+
 def get_embeddings(hf_api_key: str):
     if not hf_api_key:
         raise HTTPException(status_code=401, detail="Hugging Face API Key is required for embeddings.")
@@ -35,6 +38,15 @@ def get_embeddings(hf_api_key: str):
         task="feature-extraction",
         huggingfacehub_api_token=hf_api_key
     )
+
+def cached_embed_query(query: str, hf_api_key: str):
+    cache_key = f"{hf_api_key[:5]}_{query}"
+    if cache_key in embedding_cache:
+        return embedding_cache[cache_key]
+    embeddings_model = get_embeddings(hf_api_key)
+    vector = embeddings_model.embed_query(query)
+    embedding_cache[cache_key] = vector
+    return vector
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,7 +58,7 @@ async def lifespan(app: FastAPI):
         print("Connected to Supabase successfully!")
     yield
 
-app = FastAPI(title="RAG API Engine v4.1", lifespan=lifespan)
+app = FastAPI(title="RAG API Engine v6 - Advanced Parsing", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +85,6 @@ class ChatRequest(BaseModel):
     hf_api_key: str
     mode: str = "Auto"    
 
-
 def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, top_k: int = 3):
     if not documents: return []
     API_URL = "https://api-inference.huggingface.co/models/cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -98,9 +109,18 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             table_name="documents", query_name="hybrid_search"
         )
         
-        loader = PyPDFLoader(tmp_file_path)
-        docs = loader.load()
+        # PRIORITIES 19 & 20: Advanced Layout Parsing & OCR to Markdown
+        print(f"📄 Parsing layout of {file_name}...")
+        md_pages = pymupdf4llm.to_markdown(tmp_file_path, page_chunks=True)
         
+        docs = []
+        for page in md_pages:
+            docs.append(Document(
+                page_content=page["text"],
+                metadata={"page": page.get("metadata", {}).get("page", 1)}
+            ))
+        
+        # Summarization step based on parsed Markdown
         preview_text = " ".join([d.page_content for d in docs[:3]])[:4000]
         try:
             summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
@@ -119,7 +139,13 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         except Exception as e:
             print(f"⚠️ Auto-summary generation skipped: {e}")
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150, separators=["\n\n", "\n", ". ", " ", ""])
+        # PRIORITY 20: Markdown-Aware Splitting
+        # We prioritize splitting at headers (##) and paragraphs (\n\n) so tables are never split in half
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200, 
+            chunk_overlap=200, 
+            separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""]
+        )
         splits = text_splitter.split_documents(docs)
         del docs
         gc.collect()
@@ -140,6 +166,7 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
 
         del splits
         gc.collect()
+        print(f"✅ Background processing complete for {file_name}")
             
     except Exception as e:
         print(f"❌ Background processing failed for {file_name}: {str(e)}")
@@ -159,35 +186,62 @@ async def upload_document(
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
+    MAX_FILE_SIZE = 10 * 1024 * 1024
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    await file.seek(0)
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 10MB.")
+
     fd, tmp_file_path = tempfile.mkstemp(suffix=".pdf")
     with os.fdopen(fd, "wb") as f:
         f.write(await file.read())
         
     background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key, groq_api_key)
             
-    return {"status": "processing", "message": f"Document '{file.filename}' queued for background processing."}
+    return {"status": "processing", "message": f"Document '{file.filename}' queued for advanced layout parsing."}
 
 
 @app.post("/chat/")
 async def chat_endpoint(request: ChatRequest):
     db_history = supabase_client.table("chat_message_history").select("*").eq("session_id", request.session_id).order("created_at").execute()
     history = []
+    
+    history_text_blocks = []
     for row in db_history.data:
-        if row["role"] == "user": history.append(HumanMessage(content=row["content"]))
-        else: history.append(AIMessage(content=row["content"]))
+        if row["role"] == "user": 
+            history.append(HumanMessage(content=row["content"]))
+            history_text_blocks.append(f"User: {row['content']}")
+        else: 
+            history.append(AIMessage(content=row["content"]))
+            history_text_blocks.append(f"AI: {row['content']}")
     
     try:
         main_llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.0, api_key=request.api_key)
+        fast_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=request.api_key)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid Groq API Key.")
+
+    search_query = request.query
+    if history and request.mode.strip() != "General":
+        try:
+            rewrite_prompt = ChatPromptTemplate.from_template(
+                "Given the chat history, rewrite the user's latest query to be a standalone question. If it is already standalone, return it exactly as is. DO NOT answer it.\n\nHistory:\n{history}\n\nLatest Query: {query}"
+            )
+            search_query = (rewrite_prompt | fast_llm | StrOutputParser()).invoke({
+                "history": "\n".join(history_text_blocks[-4:]),
+                "query": request.query
+            }).strip()
+        except Exception as e:
+            print(f"Rewriter error: {e}")
 
     intent = "GENERAL"
     if request.mode.strip() == "RAG": intent = "RAG"
     elif request.mode.strip() == "Auto":
         try:
-            router = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, max_tokens=5, api_key=request.api_key)
             route_prompt = ChatPromptTemplate.from_template("Classify user input into 'RAG' (documents/files/summarize) or 'GENERAL' (trivia/general knowledge/greetings). Input: {input}. Output ONE WORD.")
-            intent_raw = (route_prompt | router | StrOutputParser()).invoke({"input": request.query}).strip().upper()
+            intent_raw = (route_prompt | fast_llm | StrOutputParser()).invoke({"input": search_query}).strip().upper()
             if "RAG" in intent_raw: intent = "RAG"
         except Exception: pass
 
@@ -197,37 +251,31 @@ async def chat_endpoint(request: ChatRequest):
         
         try:
             if intent == "RAG":
-                embeddings = get_embeddings(request.hf_api_key)
-                
-                # SAFE FILTERING: Using standard contains logic for PostgREST JSONB filtering
                 user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
                 available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
                 
                 target_filter = {"user_id": str(request.user_id)}
                 if available_files:
                     try:
-                        selector_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=request.api_key)
                         sel_prompt = ChatPromptTemplate.from_template("Given the user query and available files, select the single exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
-                        selected_file = (sel_prompt | selector_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": request.query}).strip()
+                        selected_file = (sel_prompt | fast_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": search_query}).strip()
                         if selected_file in available_files:
                             target_filter["file_name"] = selected_file
-                    except Exception as e: 
-                        print(f"Router Exception: {e}")
+                    except Exception: pass
 
-                queries = [request.query]
+                queries = [search_query]
                 try:
-                    expander_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, api_key=request.api_key)
                     exp_prompt = ChatPromptTemplate.from_template("Generate 2 alternative variations of this search query for vector retrieval. Return as a comma-separated list.\nQuery: {query}")
-                    alt_queries = (exp_prompt | expander_llm | StrOutputParser()).invoke({"query": request.query}).split(",")
+                    alt_queries = (exp_prompt | fast_llm | StrOutputParser()).invoke({"query": search_query}).split(",")
                     queries.extend([q.strip() for q in alt_queries if q.strip()])
-                except Exception as e: 
-                    print(f"Expander Exception: {e}")
+                except Exception: pass
 
                 all_raw_docs = []
                 seen_content = set()
                 
                 for q in queries:
-                    q_vector = embeddings.embed_query(q)
+                    q_vector = cached_embed_query(q, request.hf_api_key)
+                    
                     hybrid_res = supabase_client.rpc(
                         "hybrid_search",
                         {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
@@ -238,10 +286,10 @@ async def chat_endpoint(request: ChatRequest):
                             seen_content.add(r["content"])
                             all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
                 
-                best_docs_scored = cross_encode_rerank(request.query, all_raw_docs, request.hf_api_key, top_k=3)
+                best_docs_scored = cross_encode_rerank(search_query, all_raw_docs, request.hf_api_key, top_k=3)
                 
                 max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
-                CONFIDENCE_THRESHOLD = -5.0
+                CONFIDENCE_THRESHOLD = -8.0
 
                 if not best_docs_scored or max_confidence < CONFIDENCE_THRESHOLD:
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
@@ -261,7 +309,7 @@ async def chat_endpoint(request: ChatRequest):
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
                     
-                    context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText: {d.page_content}" for d, s in best_docs_scored])
+                    context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
                     system_prompt = f"You are a strict document assistant. Answer ONLY using this context:\n{context_text}\nIf not in context, say 'I cannot answer this from the documents.'"
                     
                     messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
@@ -281,7 +329,6 @@ async def chat_endpoint(request: ChatRequest):
                     yield json.dumps({"type": "token", "content": token}) + "\n"
                     
         except Exception as e:
-            # THIS PREVENTS THE SILENT UI FAILURE
             traceback.print_exc()
             error_message = f"⚠️ System Error during retrieval or generation: {str(e)}"
             yield json.dumps({"type": "metadata", "intent": "ERROR", "sources": []}) + "\n"
@@ -289,7 +336,6 @@ async def chat_endpoint(request: ChatRequest):
             final_answer_accumulator = error_message
 
         finally:
-            # Make sure memory is ALWAYS synced, even if a crash occurs
             if final_answer_accumulator:
                 supabase_client.table("chat_message_history").insert([
                     {"session_id": request.session_id, "user_id": request.user_id, "role": "user", "content": request.query},
@@ -297,7 +343,6 @@ async def chat_endpoint(request: ChatRequest):
                 ]).execute()
 
     return StreamingResponse(generate_chat_stream(), media_type="application/x-ndjson")
-
 
 @app.get("/db/explore/")
 async def explore_database(limit: int = 5):
