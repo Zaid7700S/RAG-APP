@@ -14,3 +14,4 @@ langchain-huggingface
 huggingface-hub
 
 supabase>=2.3.0
+cachetools
