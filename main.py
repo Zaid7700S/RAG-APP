@@ -312,7 +312,12 @@ async def chat_endpoint(request: ChatRequest):
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
                     context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
-                    system_prompt = f"You are a strict document assistant. Answer ONLY using this context:\n{context_text}\nIf not in context, say 'I cannot answer this from the documents.'"
+                    system_prompt = (
+                        "You are an expert document analysis assistant. Answer the user's query using ONLY the provided context below. "
+                        "Assume the user is the owner/subject of the documents. If the context contains Markdown tables, numbers, or academic grades, intelligently extract them to best answer the query.\n\n"
+                        f"Context:\n{context_text}\n\n"
+                        "If the answer cannot be reasonably found in the context, output exactly: 'I cannot answer this from the documents.'"
+                    )
                     
                     messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
                     for chunk in main_llm.stream(messages):
