@@ -23,6 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+import time
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ supabase_client: Client = None
 
 # Caching for Embeddings
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
+upload_statuses = TTLCache(maxsize=1000, ttl=86400) # NEW: Tracks background tasks for 24 hours
 
 def get_embeddings(hf_api_key: str):
     if not hf_api_key:
@@ -105,6 +107,9 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
         return [(doc, 0.1) for doc in documents[:top_k]]
 
 def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
+    task_id = f"{user_id}_{file_name}"
+    upload_statuses[task_id] = "processing" # Tell frontend we are working on it
+    
     try:
         vector_store = SupabaseVectorStore(
             client=supabase_client, embedding=get_embeddings(hf_api_key),
@@ -144,17 +149,31 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             split.metadata["chunk_number"] = idx + 1
             split.metadata["upload_date"] = upload_timestamp
         
-        BATCH_SIZE = 15  
+        BATCH_SIZE = 10  
         for i in range(0, len(splits), BATCH_SIZE):
             batch = splits[i : i + BATCH_SIZE]
-            vector_store.add_documents(batch)
+            
+            import time
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    vector_store.add_documents(batch)
+                    time.sleep(1.5) 
+                    break 
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt) 
+                    else:
+                        raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
+            
             del batch
             gc.collect()
-
-        del splits
-        gc.collect()
+            
+        upload_statuses[task_id] = "completed" # Success!
+        print(f"✅ Background processing complete for {file_name}")
             
     except Exception as e:
+        upload_statuses[task_id] = f"failed: {str(e)}" # Failed!
         print(f"❌ Background processing failed for {file_name}: {str(e)}")
     finally:
         if os.path.exists(tmp_file_path):
@@ -396,3 +415,9 @@ async def rename_session(session_id: str, request: Request):
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/upload/status/")
+async def get_upload_status(user_id: str, file_name: str):
+    """Allows frontend to poll the real-time background task status."""
+    status = upload_statuses.get(f"{user_id}_{file_name}", "unknown")
+    return {"status": status}
