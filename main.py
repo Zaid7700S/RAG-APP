@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
         print("Connected to Supabase successfully!")
     yield
 
-app = FastAPI(title="RAG API Engine v4", lifespan=lifespan)
+app = FastAPI(title="RAG API Engine v4.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,7 +91,6 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
         return [(doc, 0.1) for doc in documents[:top_k]]
 
 
-# --- PRIORITY 8 & 11: BACKGROUND PROCESSING & AUTO-SUMMARIZATION ---
 def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
     try:
         vector_store = SupabaseVectorStore(
@@ -102,13 +101,11 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         loader = PyPDFLoader(tmp_file_path)
         docs = loader.load()
         
-        # Priority 11: Generate Title & Summary from first few pages
         preview_text = " ".join([d.page_content for d in docs[:3]])[:4000]
         try:
             summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
             sum_prompt = ChatPromptTemplate.from_template("Analyze text and output JSON with keys 'title', 'summary', and 'keywords' (array).\nText: {text}")
             res = (sum_prompt | summary_llm | StrOutputParser()).invoke({"text": preview_text})
-            # Clean JSON formatting
             clean_res = res.replace("```json", "").replace("```", "").strip()
             parsed_summary = json.loads(clean_res)
             
@@ -157,7 +154,7 @@ async def upload_document(
     file: UploadFile = File(...), 
     user_id: str = Form(...),
     hf_api_key: str = Form(...),
-    groq_api_key: str = Form(...) # Added to support auto-summarization LLM calls
+    groq_api_key: str = Form(...) 
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -198,95 +195,106 @@ async def chat_endpoint(request: ChatRequest):
         sources_data = []
         final_answer_accumulator = ""
         
-        if intent == "RAG":
-            embeddings = get_embeddings(request.hf_api_key)
-            
-            # PRIORITY 12: Intelligent Document Selection (Targeted Scoping)
-            user_docs = supabase_client.table("documents").select("metadata").eq("metadata->>user_id", request.user_id).execute()
-            available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
-            
-            target_filter = {"user_id": str(request.user_id)}
-            if available_files:
+        try:
+            if intent == "RAG":
+                embeddings = get_embeddings(request.hf_api_key)
+                
+                # SAFE FILTERING: Using standard contains logic for PostgREST JSONB filtering
+                user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
+                available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
+                
+                target_filter = {"user_id": str(request.user_id)}
+                if available_files:
+                    try:
+                        selector_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=request.api_key)
+                        sel_prompt = ChatPromptTemplate.from_template("Given the user query and available files, select the single exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
+                        selected_file = (sel_prompt | selector_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": request.query}).strip()
+                        if selected_file in available_files:
+                            target_filter["file_name"] = selected_file
+                    except Exception as e: 
+                        print(f"Router Exception: {e}")
+
+                queries = [request.query]
                 try:
-                    selector_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=request.api_key)
-                    sel_prompt = ChatPromptTemplate.from_template("Given the user query and available files, select the single exact file name needed, or output 'ALL'. Available: {files}. Query: {query}")
-                    selected_file = (sel_prompt | selector_llm | StrOutputParser()).invoke({"files": json.dumps(available_files), "query": request.query}).strip()
-                    if selected_file in available_files:
-                        target_filter["file_name"] = selected_file
-                except Exception: pass
+                    expander_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, api_key=request.api_key)
+                    exp_prompt = ChatPromptTemplate.from_template("Generate 2 alternative variations of this search query for vector retrieval. Return as a comma-separated list.\nQuery: {query}")
+                    alt_queries = (exp_prompt | expander_llm | StrOutputParser()).invoke({"query": request.query}).split(",")
+                    queries.extend([q.strip() for q in alt_queries if q.strip()])
+                except Exception as e: 
+                    print(f"Expander Exception: {e}")
 
-            # PRIORITY 13: Multi-Query Retrieval Expansion
-            queries = [request.query]
-            try:
-                expander_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, api_key=request.api_key)
-                exp_prompt = ChatPromptTemplate.from_template("Generate 2 alternative variations of this search query for vector retrieval. Return as a comma-separated list.\nQuery: {query}")
-                alt_queries = (exp_prompt | expander_llm | StrOutputParser()).invoke({"query": request.query}).split(",")
-                queries.extend([q.strip() for q in alt_queries if q.strip()])
-            except Exception: pass
-
-            # Aggregate and merge chunks across all query variations
-            all_raw_docs = []
-            seen_content = set()
-            
-            for q in queries:
-                q_vector = embeddings.embed_query(q)
-                hybrid_res = supabase_client.rpc(
-                    "hybrid_search",
-                    {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
-                ).execute()
+                all_raw_docs = []
+                seen_content = set()
                 
-                for r in hybrid_res.data:
-                    if r["content"] not in seen_content:
-                        seen_content.add(r["content"])
-                        all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
-            
-            best_docs_scored = cross_encode_rerank(request.query, all_raw_docs, request.hf_api_key, top_k=3)
-            
-            # PRIORITY 10: Confidence Check
-            max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
-            CONFIDENCE_THRESHOLD = -5.0
+                for q in queries:
+                    q_vector = embeddings.embed_query(q)
+                    hybrid_res = supabase_client.rpc(
+                        "hybrid_search",
+                        {"query_text": q, "query_embedding": q_vector, "match_count": 5, "filter": target_filter}
+                    ).execute()
+                    
+                    for r in hybrid_res.data:
+                        if r["content"] not in seen_content:
+                            seen_content.add(r["content"])
+                            all_raw_docs.append(Document(page_content=r["content"], metadata={**r["metadata"], "similarity": r["similarity"]}))
+                
+                best_docs_scored = cross_encode_rerank(request.query, all_raw_docs, request.hf_api_key, top_k=3)
+                
+                max_confidence = max([score for doc, score in best_docs_scored]) if best_docs_scored else 0
+                CONFIDENCE_THRESHOLD = -5.0
 
-            if not best_docs_scored or max_confidence < CONFIDENCE_THRESHOLD:
+                if not best_docs_scored or max_confidence < CONFIDENCE_THRESHOLD:
+                    yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
+                    msg = "I could not confidently answer from your uploaded documents. Please ensure they contain the relevant information."
+                    for word in msg.split():
+                        yield json.dumps({"type": "token", "content": word + " "}) + "\n"
+                        final_answer_accumulator += word + " "
+                else:
+                    for doc, score in best_docs_scored:
+                        sources_data.append({
+                            "source": doc.metadata.get('file_name', 'Unknown'),
+                            "page": doc.metadata.get('page', '?'),
+                            "chunk": doc.metadata.get('chunk_number', '?'),
+                            "confidence_score": round(score, 3),
+                            "snippet": doc.page_content[:150].replace('\n', ' ') + "..."
+                        })
+                        
+                    yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
+                    
+                    context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText: {d.page_content}" for d, s in best_docs_scored])
+                    system_prompt = f"You are a strict document assistant. Answer ONLY using this context:\n{context_text}\nIf not in context, say 'I cannot answer this from the documents.'"
+                    
+                    messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
+                    
+                    for chunk in main_llm.stream(messages):
+                        token = chunk.content
+                        final_answer_accumulator += token
+                        yield json.dumps({"type": "token", "content": token}) + "\n"
+                    
+            else:
                 yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
-                msg = "I could not confidently answer from your uploaded documents."
-                for word in msg.split():
-                    yield json.dumps({"type": "token", "content": word + " "}) + "\n"
-                return
-            
-            for doc, score in best_docs_scored:
-                sources_data.append({
-                    "source": doc.metadata.get('file_name', 'Unknown'),
-                    "page": doc.metadata.get('page', '?'),
-                    "chunk": doc.metadata.get('chunk_number', '?'),
-                    "confidence_score": round(score, 3),
-                    "snippet": doc.page_content[:150].replace('\n', ' ') + "..."
-                })
+                messages = [SystemMessage(content="You are a helpful AI assistant.")] + history + [HumanMessage(content=request.query)]
                 
-            yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
-            
-            context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText: {d.page_content}" for d, s in best_docs_scored])
-            system_prompt = f"You are a strict document assistant. Answer ONLY using this context:\n{context_text}\nIf not in context, say 'I cannot answer this from the documents.'"
-            
-            messages = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=request.query)]
-            
-            for chunk in main_llm.stream(messages):
-                token = chunk.content
-                final_answer_accumulator += token
-                yield json.dumps({"type": "token", "content": token}) + "\n"
-                
-        else:
-            yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
-            messages = [SystemMessage(content="You are a helpful AI assistant.")] + history + [HumanMessage(content=request.query)]
-            
-            for chunk in main_llm.stream(messages):
-                token = chunk.content
-                final_answer_accumulator += token
-                yield json.dumps({"type": "token", "content": token}) + "\n"
+                for chunk in main_llm.stream(messages):
+                    token = chunk.content
+                    final_answer_accumulator += token
+                    yield json.dumps({"type": "token", "content": token}) + "\n"
+                    
+        except Exception as e:
+            # THIS PREVENTS THE SILENT UI FAILURE
+            traceback.print_exc()
+            error_message = f"⚠️ System Error during retrieval or generation: {str(e)}"
+            yield json.dumps({"type": "metadata", "intent": "ERROR", "sources": []}) + "\n"
+            yield json.dumps({"type": "token", "content": error_message}) + "\n"
+            final_answer_accumulator = error_message
 
-        supabase_client.table("chat_message_history").insert([
-            {"session_id": request.session_id, "user_id": request.user_id, "role": "user", "content": request.query},
-            {"session_id": request.session_id, "user_id": request.user_id, "role": "ai", "content": final_answer_accumulator}
-        ]).execute()
+        finally:
+            # Make sure memory is ALWAYS synced, even if a crash occurs
+            if final_answer_accumulator:
+                supabase_client.table("chat_message_history").insert([
+                    {"session_id": request.session_id, "user_id": request.user_id, "role": "user", "content": request.query},
+                    {"session_id": request.session_id, "user_id": request.user_id, "role": "ai", "content": final_answer_accumulator}
+                ]).execute()
 
     return StreamingResponse(generate_chat_stream(), media_type="application/x-ndjson")
 
