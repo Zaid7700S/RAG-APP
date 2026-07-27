@@ -343,6 +343,48 @@ async def chat_endpoint(request: ChatRequest):
                 ]).execute()
 
     return StreamingResponse(generate_chat_stream(), media_type="application/x-ndjson")
+# --- PRIORITY 18: FRONTEND UI SUPPORT ENDPOINTS ---
+
+@app.get("/api/documents/{user_id}")
+async def get_user_documents(user_id: str):
+    """Fetches all documents uploaded by a specific user."""
+    if supabase_client is None: 
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        res = supabase_client.table("document_summaries").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+        return {"status": "success", "documents": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/documents/{user_id}/{file_name}")
+async def delete_user_document(user_id: str, file_name: str):
+    """Deletes a document from both the vector store and the summary table."""
+    if supabase_client is None: 
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        # Delete raw chunks from vector store using JSONB containment filter
+        supabase_client.table("documents").delete().contains("metadata", {"user_id": user_id, "file_name": file_name}).execute()
+        # Delete metadata from summaries
+        supabase_client.table("document_summaries").delete().eq("user_id", user_id).eq("file_name", file_name).execute()
+        return {"status": "success", "message": f"Deleted {file_name}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request):
+    """Allows users to rename their chat history sidebar items."""
+    if supabase_client is None: 
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        body = await request.json()
+        new_title = body.get("title")
+        if not new_title:
+            raise HTTPException(status_code=400, detail="Title is required")
+            
+        supabase_client.table("workspace_sessions").update({"title": new_title}).eq("id", session_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/db/explore/")
 async def explore_database(limit: int = 5):
