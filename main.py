@@ -1,6 +1,7 @@
 import os
 import tempfile
 import traceback
+import gc
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.responses import JSONResponse
@@ -160,14 +161,35 @@ async def upload_document(file: UploadFile = File(...), user_id: str = Form(...)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
         
+        # Free memory from original document objects
+        del docs
+        gc.collect()
+
         # Attach user_id and file_name to metadata for user isolation
         for split in splits:
             split.metadata["user_id"] = str(user_id)
             split.metadata["file_name"] = file.filename
         
-        vector_store.add_documents(splits)
+        # --- BATCH PROCESSING LOGIC (Prevents 512MB RAM Overflows) ---
+        BATCH_SIZE = 15  # Process 15 chunks at a time
+        total_chunks = len(splits)
+        print(f"📦 Total Chunks: {total_chunks}. Processing in batches of {BATCH_SIZE}...")
+
+        for i in range(0, total_chunks, BATCH_SIZE):
+            batch = splits[i : i + BATCH_SIZE]
+            print(f"⏳ Embedding batch {i // BATCH_SIZE + 1} of {(total_chunks + BATCH_SIZE - 1) // BATCH_SIZE}...")
             
-    return {"status": "success", "message": f"Document '{file.filename}' securely stored for user {user_id}."}
+            vector_store.add_documents(batch)
+            
+            # Explicitly free batch memory after write
+            del batch
+            gc.collect()
+
+        # Final cleanup
+        del splits
+        gc.collect()
+            
+    return {"status": "success", "message": f"Document '{file.filename}' successfully processed and stored for user {user_id}."}
 
 
 @app.post("/chat/", response_model=ChatResponse)
@@ -191,7 +213,7 @@ async def chat_endpoint(request: ChatRequest):
     
     vector_store = get_vector_store()
 
-   # --- SMART INTENT ROUTING ---
+    # --- SMART INTENT ROUTING ---
     selected_mode = request.mode.strip()
     if selected_mode == "General":
         intent = "GENERAL"
