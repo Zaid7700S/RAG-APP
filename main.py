@@ -24,6 +24,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 import time
+import fitz
 
 load_dotenv()
 
@@ -108,7 +109,7 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
 
 def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
     task_id = f"{user_id}_{file_name}"
-    upload_statuses[task_id] = "processing" # Tell frontend we are working on it
+    upload_statuses[task_id] = "processing"
     
     try:
         vector_store = SupabaseVectorStore(
@@ -116,14 +117,19 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             table_name="documents", query_name="hybrid_search"
         )
         
-        md_pages = pymupdf4llm.to_markdown(tmp_file_path, page_chunks=True)
-        docs = [Document(page_content=p["text"], metadata={"page": p.get("metadata", {}).get("page", 1)}) for p in md_pages]
+        # --- MEMORY OPTIMIZATION: Open stream, DO NOT load to memory ---
+        doc = fitz.open(tmp_file_path)
+        total_pages = len(doc)
         
-        preview_text = " ".join([d.page_content for d in docs[:3]])[:4000]
+        # 1. Generate Summary from first 3 pages ONLY to save memory
+        preview_text = ""
+        for i in range(min(3, total_pages)):
+            preview_text += pymupdf4llm.to_markdown(doc, pages=[i])
+        
         try:
             summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
             sum_prompt = ChatPromptTemplate.from_template("Analyze text and output JSON with keys 'title', 'summary', and 'keywords' (array).\nText: {text}")
-            res = (sum_prompt | summary_llm | StrOutputParser()).invoke({"text": preview_text})
+            res = (sum_prompt | summary_llm | StrOutputParser()).invoke({"text": preview_text[:4000]})
             clean_res = res.replace("```json", "").replace("```", "").strip()
             parsed_summary = json.loads(clean_res)
             
@@ -137,43 +143,66 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         except Exception as e:
             print(f"⚠️ Auto-summary skipped: {e}")
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200, separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""])
-        splits = text_splitter.split_documents(docs)
-        del docs
+        # Clear preview text from memory
+        del preview_text
         gc.collect()
 
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200, separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""])
         upload_timestamp = datetime.now().isoformat()
-        for idx, split in enumerate(splits):
-            split.metadata["user_id"] = str(user_id)
-            split.metadata["file_name"] = file_name
-            split.metadata["chunk_number"] = idx + 1
-            split.metadata["upload_date"] = upload_timestamp
         
-        BATCH_SIZE = 10  
-        for i in range(0, len(splits), BATCH_SIZE):
-            batch = splits[i : i + BATCH_SIZE]
+        chunk_counter = 1
+        
+        # 2. Iterate PAGE BY PAGE (Keeps RAM perfectly flat)
+        for page_num in range(total_pages):
+            # Tell the frontend exactly which page we are on
+            upload_statuses[task_id] = f"processing page {page_num + 1} of {total_pages}"
             
-            import time
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    vector_store.add_documents(batch)
-                    time.sleep(1.5) 
-                    break 
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt) 
-                    else:
-                        raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
+            # Extract markdown for ONLY this single page
+            page_md = pymupdf4llm.to_markdown(doc, pages=[page_num])
             
-            del batch
+            # Split this single page
+            page_doc = Document(page_content=page_md, metadata={"page": page_num + 1})
+            splits = text_splitter.split_documents([page_doc])
+            
+            for split in splits:
+                split.metadata["user_id"] = str(user_id)
+                split.metadata["file_name"] = file_name
+                split.metadata["chunk_number"] = chunk_counter
+                split.metadata["upload_date"] = upload_timestamp
+                chunk_counter += 1
+            
+            # Upload chunks for this page
+            BATCH_SIZE = 10  
+            for i in range(0, len(splits), BATCH_SIZE):
+                batch = splits[i : i + BATCH_SIZE]
+                import time
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        vector_store.add_documents(batch)
+                        time.sleep(1.5) 
+                        break 
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt) 
+                        else:
+                            raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
+                del batch
+            
+            # --- CRITICAL: Manually trigger Garbage Collection after every page ---
+            del page_md
+            del page_doc
+            del splits
             gc.collect()
-            
-        upload_statuses[task_id] = "completed" # Success!
+        
+        # Close the PDF stream
+        doc.close()
+        
+        upload_statuses[task_id] = "completed"
         print(f"✅ Background processing complete for {file_name}")
             
     except Exception as e:
-        upload_statuses[task_id] = f"failed: {str(e)}" # Failed!
+        upload_statuses[task_id] = f"failed: {str(e)}"
         print(f"❌ Background processing failed for {file_name}: {str(e)}")
     finally:
         if os.path.exists(tmp_file_path):
