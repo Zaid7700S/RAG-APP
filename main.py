@@ -19,7 +19,7 @@ from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client, Client
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
@@ -30,37 +30,36 @@ load_dotenv()
 
 supabase_client: Client = None
 
-# Caching for Embeddings
+# Caching for Embeddings & Clients
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
-upload_statuses = TTLCache(maxsize=1000, ttl=86400) # Tracks background tasks for 24 hours
+embedding_clients = TTLCache(maxsize=100, ttl=86400) 
+upload_statuses = TTLCache(maxsize=1000, ttl=86400) 
 
-# --- NEW: SYSTEM CAPABILITIES PROMPT ---
 SYSTEM_CAPABILITIES_PROMPT = """
 You are the intelligent assistant for this Workspace & Document Intelligence Application. 
 When users ask what you can do, who you are, or how to use the system, explain your features clearly using these details about THIS application:
-
-1. 📄 **Document RAG & PDF Analysis**: You can upload PDF documents into any session. The backend parses them page-by-page into clean Markdown and builds vector embeddings for fast, accurate retrieval.
-2. 🌐 **Dual Search Scopes**:
-   - **Current Session Only**: Restricts search exclusively to PDFs attached in the active chat.
-   - **All Uploaded Files (Global Scope)**: Searches across your entire historical PDF database from all past sessions.
-3. ⚡ **Smart Routing Modes**:
-   - **Auto-Router (Default)**: Automatically detects whether your question needs document search, system help, or general knowledge.
-   - **RAG Mode**: Forces strict vector retrieval from your uploaded PDFs with exact page and confidence citations.
-   - **General Mode**: Direct conversation for general knowledge, coding, or text generation without searching files.
-4. 🔍 **Hybrid Search & Re-ranking**: Uses hybrid vector search combined with Cross-Encoder reranking for high accuracy.
-5. 📂 **Document Manager**: Manage uploaded files, view AI-generated summaries, and delete documents from vector storage anytime.
-
+1. 📄 **Document RAG & PDF Analysis**: You can upload PDF documents into any session. The backend parses them into text and builds vector embeddings for fast, accurate retrieval.
+2. 🌐 **Dual Search Scopes**: Restrict searches to the 'Current Session Only' or search across 'All Uploaded Files' in your database.
+3. ⚡ **Smart Routing Modes**: Auto-Router (detects intent automatically), RAG Mode (forces strict document search), and General Mode (direct AI conversation).
+4. 🔍 **Hybrid Search & Re-ranking**: Uses vector search combined with Cross-Encoder reranking for high accuracy.
+5. 🚀 **Dual Processing Engines**: Supports both Fast Mode (pure text extraction) and Deep Scan (complex layout and table parsing).
 Respond in a helpful, friendly, and structured format using clear markdown formatting.
 """
 
 def get_embeddings(hf_api_key: str):
     if not hf_api_key:
         raise HTTPException(status_code=401, detail="Hugging Face API Key is required for embeddings.")
-    return HuggingFaceEndpointEmbeddings(
+    
+    if hf_api_key in embedding_clients:
+        return embedding_clients[hf_api_key]
+        
+    client = HuggingFaceEndpointEmbeddings(
         model="sentence-transformers/all-MiniLM-L6-v2",
         task="feature-extraction",
         huggingfacehub_api_token=hf_api_key
     )
+    embedding_clients[hf_api_key] = client
+    return client
 
 def cached_embed_query(query: str, hf_api_key: str):
     cache_key = f"{hf_api_key[:5]}_{query}"
@@ -81,7 +80,7 @@ async def lifespan(app: FastAPI):
         print("Connected to Supabase successfully!")
     yield
 
-app = FastAPI(title="RAG API Engine v8 - Dynamic Scoping", lifespan=lifespan)
+app = FastAPI(title="RAG API Engine v10 - Fast Engine Toggle", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,7 +107,7 @@ class ChatRequest(BaseModel):
     hf_api_key: str
     mode: str = "Auto"
     active_files: list = [] 
-    search_all_files: bool = False  # The new scope toggle flag
+    search_all_files: bool = False 
 
 def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, top_k: int = 3):
     if not documents: return []
@@ -126,7 +125,7 @@ def cross_encode_rerank(query: str, documents: list[Document], hf_api_key: str, 
     except Exception:
         return [(doc, 0.1) for doc in documents[:top_k]]
 
-def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str):
+def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_api_key: str, groq_api_key: str, fast_mode: str):
     task_id = f"{user_id}_{file_name}"
     upload_statuses[task_id] = "processing"
     
@@ -136,14 +135,16 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             table_name="documents", query_name="hybrid_search"
         )
         
-        # --- MEMORY OPTIMIZATION: Open stream, DO NOT load to memory ---
         doc = fitz.open(tmp_file_path)
         total_pages = len(doc)
         
-        # 1. Generate Summary from first 3 pages ONLY to save memory
+        # 1. Generate Summary from first 3 pages
         preview_text = ""
         for i in range(min(3, total_pages)):
-            preview_text += pymupdf4llm.to_markdown(doc, pages=[i])
+            if fast_mode == "true":
+                preview_text += doc[i].get_text("text")
+            else:
+                preview_text += pymupdf4llm.to_markdown(doc, pages=[i])
         
         try:
             summary_llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, api_key=groq_api_key)
@@ -162,20 +163,22 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         except Exception as e:
             print(f"⚠️ Auto-summary skipped: {e}")
 
-        # Clear preview text from memory
         del preview_text
         gc.collect()
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200, separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""])
         upload_timestamp = datetime.now().isoformat()
-        
         chunk_counter = 1
         
-        # 2. Iterate PAGE BY PAGE (Keeps RAM perfectly flat)
         for page_num in range(total_pages):
             upload_statuses[task_id] = f"processing page {page_num + 1} of {total_pages}"
             
-            page_md = pymupdf4llm.to_markdown(doc, pages=[page_num])
+            # --- DYNAMIC EXTRACTION ENGINE ---
+            if fast_mode == "true":
+                page_md = doc[page_num].get_text("text")
+            else:
+                page_md = pymupdf4llm.to_markdown(doc, pages=[page_num])
+                
             page_doc = Document(page_content=page_md, metadata={"page": page_num + 1})
             splits = text_splitter.split_documents([page_doc])
             
@@ -186,36 +189,32 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
                 split.metadata["upload_date"] = upload_timestamp
                 chunk_counter += 1
             
-            # --- OPTIMIZED: Increased BATCH_SIZE to 15 & Added Adaptive Rate-Limit Backoff ---
-            BATCH_SIZE = 15
+            BATCH_SIZE = 20  
             for i in range(0, len(splits), BATCH_SIZE):
                 batch = splits[i : i + BATCH_SIZE]
-                max_retries = 3
+                max_retries = 4
                 for attempt in range(max_retries):
                     try:
                         vector_store.add_documents(batch)
-                        # No hardcoded time.sleep(1.5) here! Only pauses if an exception occurs below.
                         break 
                     except Exception as e:
                         error_str = str(e).lower()
-                        # Adaptive Backoff: Sleep longer if Hugging Face throws a 429 Rate Limit
                         if "429" in error_str or "too many requests" in error_str or attempt < max_retries - 1:
-                            sleep_time = (2 ** attempt) * 2  # Sleeps 2s, 4s, 8s on rate limits
+                            sleep_time = (2 ** attempt) * 2 
                             print(f"⚠️ API Rate Limit/Error on Batch. Waiting {sleep_time}s...")
                             time.sleep(sleep_time)
                         else:
                             raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
                 del batch
             
-            # --- OPTIMIZED: Run Garbage Collection every 5 pages instead of every single page ---
             del page_md
             del page_doc
             del splits
+            
             if page_num % 5 == 0 or page_num == total_pages - 1:
                 gc.collect()
         
         doc.close()
-        
         upload_statuses[task_id] = "completed"
         print(f"✅ Background processing complete for {file_name}")
             
@@ -232,7 +231,8 @@ async def upload_document(
     file: UploadFile = File(...), 
     user_id: str = Form(...),
     hf_api_key: str = Form(...),
-    groq_api_key: str = Form(...) 
+    groq_api_key: str = Form(...),
+    fast_mode: str = Form("true") # NEW FIELD
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -249,9 +249,8 @@ async def upload_document(
     with os.fdopen(fd, "wb") as f:
         f.write(await file.read())
         
-    background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key, groq_api_key)
-    return {"status": "processing", "message": f"Document '{file.filename}' queued for advanced layout parsing."}
-
+    background_tasks.add_task(process_pdf_background, tmp_file_path, file.filename, user_id, hf_api_key, groq_api_key, fast_mode)
+    return {"status": "processing", "message": f"Document '{file.filename}' queued for parsing."}
 
 @app.post("/chat/")
 async def chat_endpoint(request: ChatRequest):
@@ -274,54 +273,43 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=401, detail="Invalid Groq API Key.")
 
     search_query = request.query
-    if history and request.mode.strip() != "General":
-        try:
-            rewrite_prompt = ChatPromptTemplate.from_template(
-                "You are a strict search query optimizer. Look at the chat history and the user's latest query.\n"
-                "1. If the latest query uses pronouns (it, they, this, he, she) or explicitly refers to something in the previous message, rewrite it into a standalone search query.\n"
-                "2. HOWEVER, if the latest query is already clear and standalone, OR if it is identical to a previous question, you MUST return the latest query exactly word-for-word without changing a single letter.\n"
-                "DO NOT answer the question. ONLY output the search query.\n\n"
-                "History:\n{history}\n\nLatest Query: {query}"
-            )
-            search_query = (rewrite_prompt | fast_llm | StrOutputParser()).invoke({
-                "history": "\n".join(history_text_blocks[-4:]),
-                "query": request.query
-            }).strip()
-        except Exception: pass
-
-    # --- OPTIMIZED: 3-WAY INTENT ROUTING (SYSTEM, RAG, GENERAL) ---
     intent = "GENERAL"
-    cap_keywords = [
-        "what can you do", "what do you do", "how to use", "who are you", 
-        "what is this app", "system features", "your capabilities", "help me use this"
-    ]
-    is_capability_query = any(k in search_query.lower() for k in cap_keywords)
-
-    if is_capability_query:
-        intent = "SYSTEM"
-    elif request.mode.strip() == "RAG":
+    
+    if request.mode.strip() == "RAG": 
         intent = "RAG"
+        if history:
+            try:
+                rewrite_prompt = ChatPromptTemplate.from_template("Rewrite user query to be a standalone search term considering context. History: {history} Query: {query}. Output ONLY the query.")
+                search_query = (rewrite_prompt | fast_llm | StrOutputParser()).invoke({"history": "\n".join(history_text_blocks[-4:]), "query": request.query}).strip()
+            except: pass
+            
     elif request.mode.strip() == "Auto":
         try:
             route_prompt = ChatPromptTemplate.from_template(
-                "Classify user input into one of three choices:\n"
-                "- 'SYSTEM': Questions about this app's features, capabilities, how to use it, or who you are.\n"
-                "- 'RAG': Questions asking about specific document contents, uploaded files, data extraction, or summaries.\n"
-                "- 'GENERAL': General trivia, coding, greetings, or broad knowledge.\n\n"
-                "Input: {input}\n"
-                "Output ONE WORD (SYSTEM, RAG, or GENERAL)."
+                "Analyze the user's latest query given the conversation history.\n"
+                "1. Determine intent: 'RAG' (asking about documents/data), 'SYSTEM' (asking how this app works, what you can do, or who you are), or 'GENERAL' (coding, general knowledge).\n"
+                "2. Rewrite the query to be standalone if it uses pronouns referring to history. Otherwise, keep it exactly the same.\n\n"
+                "History: {history}\nLatest Query: {query}\n\n"
+                "Output strictly a JSON object with keys 'intent' and 'search_query'. Do not include markdown blocks."
             )
-            intent_raw = (route_prompt | fast_llm | StrOutputParser()).invoke({"input": search_query}).strip().upper()
-            if "SYSTEM" in intent_raw: intent = "SYSTEM"
-            elif "RAG" in intent_raw: intent = "RAG"
-        except Exception: pass
+            res_raw = (route_prompt | fast_llm | StrOutputParser()).invoke({
+                "history": "\n".join(history_text_blocks[-4:]) if history else "None", 
+                "query": request.query
+            }).strip()
+            
+            clean_json = res_raw.replace("```json", "").replace("```", "").strip()
+            parsed_data = json.loads(clean_json)
+            
+            intent = parsed_data.get("intent", "GENERAL").upper()
+            search_query = parsed_data.get("search_query", request.query)
+        except Exception: 
+            pass
 
     async def generate_chat_stream():
         sources_data = []
         final_answer_accumulator = ""
         
         try:
-            # --- NEW: SYSTEM INTENT BRANCH (Works even with 0 files uploaded) ---
             if intent == "SYSTEM":
                 yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
                 messages = [SystemMessage(content=SYSTEM_CAPABILITIES_PROMPT)] + history + [HumanMessage(content=request.query)]
@@ -329,11 +317,10 @@ async def chat_endpoint(request: ChatRequest):
                     token = chunk.content
                     final_answer_accumulator += token
                     yield json.dumps({"type": "token", "content": token}) + "\n"
-
+                    
             elif intent == "RAG":
                 target_filter = {"user_id": str(request.user_id)}
                 
-                # --- DYNAMIC SCOPE CONTROL ---
                 if request.search_all_files:
                     user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
                     available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
@@ -364,12 +351,6 @@ async def chat_endpoint(request: ChatRequest):
                         return
 
                 queries = [search_query]
-                try:
-                    exp_prompt = ChatPromptTemplate.from_template("Generate 2 alternative variations of this search query for vector retrieval. Return as a comma-separated list.\nQuery: {query}")
-                    alt_queries = (exp_prompt | fast_llm | StrOutputParser()).invoke({"query": search_query}).split(",")
-                    queries.extend([q.strip() for q in alt_queries if q.strip()])
-                except Exception: pass
-
                 all_raw_docs = []
                 seen_content = set()
                 
@@ -407,7 +388,6 @@ async def chat_endpoint(request: ChatRequest):
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
                     context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
-                    
                     system_prompt = (
                         "You are an expert document analysis assistant. Answer the user's query using ONLY the provided context below. "
                         "Assume the user is the owner/subject of the documents. "
