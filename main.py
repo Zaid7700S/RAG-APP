@@ -32,7 +32,26 @@ supabase_client: Client = None
 
 # Caching for Embeddings
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
-upload_statuses = TTLCache(maxsize=1000, ttl=86400) # NEW: Tracks background tasks for 24 hours
+upload_statuses = TTLCache(maxsize=1000, ttl=86400) # Tracks background tasks for 24 hours
+
+# --- NEW: SYSTEM CAPABILITIES PROMPT ---
+SYSTEM_CAPABILITIES_PROMPT = """
+You are the intelligent assistant for this Workspace & Document Intelligence Application. 
+When users ask what you can do, who you are, or how to use the system, explain your features clearly using these details about THIS application:
+
+1. 📄 **Document RAG & PDF Analysis**: You can upload PDF documents into any session. The backend parses them page-by-page into clean Markdown and builds vector embeddings for fast, accurate retrieval.
+2. 🌐 **Dual Search Scopes**:
+   - **Current Session Only**: Restricts search exclusively to PDFs attached in the active chat.
+   - **All Uploaded Files (Global Scope)**: Searches across your entire historical PDF database from all past sessions.
+3. ⚡ **Smart Routing Modes**:
+   - **Auto-Router (Default)**: Automatically detects whether your question needs document search, system help, or general knowledge.
+   - **RAG Mode**: Forces strict vector retrieval from your uploaded PDFs with exact page and confidence citations.
+   - **General Mode**: Direct conversation for general knowledge, coding, or text generation without searching files.
+4. 🔍 **Hybrid Search & Re-ranking**: Uses hybrid vector search combined with Cross-Encoder reranking for high accuracy.
+5. 📂 **Document Manager**: Manage uploaded files, view AI-generated summaries, and delete documents from vector storage anytime.
+
+Respond in a helpful, friendly, and structured format using clear markdown formatting.
+"""
 
 def get_embeddings(hf_api_key: str):
     if not hf_api_key:
@@ -154,13 +173,9 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         
         # 2. Iterate PAGE BY PAGE (Keeps RAM perfectly flat)
         for page_num in range(total_pages):
-            # Tell the frontend exactly which page we are on
             upload_statuses[task_id] = f"processing page {page_num + 1} of {total_pages}"
             
-            # Extract markdown for ONLY this single page
             page_md = pymupdf4llm.to_markdown(doc, pages=[page_num])
-            
-            # Split this single page
             page_doc = Document(page_content=page_md, metadata={"page": page_num + 1})
             splits = text_splitter.split_documents([page_doc])
             
@@ -171,31 +186,34 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
                 split.metadata["upload_date"] = upload_timestamp
                 chunk_counter += 1
             
-            # Upload chunks for this page
-            BATCH_SIZE = 10  
+            # --- OPTIMIZED: Increased BATCH_SIZE to 15 & Added Adaptive Rate-Limit Backoff ---
+            BATCH_SIZE = 15
             for i in range(0, len(splits), BATCH_SIZE):
                 batch = splits[i : i + BATCH_SIZE]
-                import time
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
                         vector_store.add_documents(batch)
-                        time.sleep(1.5) 
+                        # No hardcoded time.sleep(1.5) here! Only pauses if an exception occurs below.
                         break 
                     except Exception as e:
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt) 
+                        error_str = str(e).lower()
+                        # Adaptive Backoff: Sleep longer if Hugging Face throws a 429 Rate Limit
+                        if "429" in error_str or "too many requests" in error_str or attempt < max_retries - 1:
+                            sleep_time = (2 ** attempt) * 2  # Sleeps 2s, 4s, 8s on rate limits
+                            print(f"⚠️ API Rate Limit/Error on Batch. Waiting {sleep_time}s...")
+                            time.sleep(sleep_time)
                         else:
                             raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
                 del batch
             
-            # --- CRITICAL: Manually trigger Garbage Collection after every page ---
+            # --- OPTIMIZED: Run Garbage Collection every 5 pages instead of every single page ---
             del page_md
             del page_doc
             del splits
-            gc.collect()
+            if page_num % 5 == 0 or page_num == total_pages - 1:
+                gc.collect()
         
-        # Close the PDF stream
         doc.close()
         
         upload_statuses[task_id] = "completed"
@@ -271,13 +289,31 @@ async def chat_endpoint(request: ChatRequest):
             }).strip()
         except Exception: pass
 
+    # --- OPTIMIZED: 3-WAY INTENT ROUTING (SYSTEM, RAG, GENERAL) ---
     intent = "GENERAL"
-    if request.mode.strip() == "RAG": intent = "RAG"
+    cap_keywords = [
+        "what can you do", "what do you do", "how to use", "who are you", 
+        "what is this app", "system features", "your capabilities", "help me use this"
+    ]
+    is_capability_query = any(k in search_query.lower() for k in cap_keywords)
+
+    if is_capability_query:
+        intent = "SYSTEM"
+    elif request.mode.strip() == "RAG":
+        intent = "RAG"
     elif request.mode.strip() == "Auto":
         try:
-            route_prompt = ChatPromptTemplate.from_template("Classify user input into 'RAG' (documents/files/summarize) or 'GENERAL' (trivia/general knowledge/greetings). Input: {input}. Output ONE WORD.")
+            route_prompt = ChatPromptTemplate.from_template(
+                "Classify user input into one of three choices:\n"
+                "- 'SYSTEM': Questions about this app's features, capabilities, how to use it, or who you are.\n"
+                "- 'RAG': Questions asking about specific document contents, uploaded files, data extraction, or summaries.\n"
+                "- 'GENERAL': General trivia, coding, greetings, or broad knowledge.\n\n"
+                "Input: {input}\n"
+                "Output ONE WORD (SYSTEM, RAG, or GENERAL)."
+            )
             intent_raw = (route_prompt | fast_llm | StrOutputParser()).invoke({"input": search_query}).strip().upper()
-            if "RAG" in intent_raw: intent = "RAG"
+            if "SYSTEM" in intent_raw: intent = "SYSTEM"
+            elif "RAG" in intent_raw: intent = "RAG"
         except Exception: pass
 
     async def generate_chat_stream():
@@ -285,12 +321,20 @@ async def chat_endpoint(request: ChatRequest):
         final_answer_accumulator = ""
         
         try:
-            if intent == "RAG":
+            # --- NEW: SYSTEM INTENT BRANCH (Works even with 0 files uploaded) ---
+            if intent == "SYSTEM":
+                yield json.dumps({"type": "metadata", "intent": intent, "sources": []}) + "\n"
+                messages = [SystemMessage(content=SYSTEM_CAPABILITIES_PROMPT)] + history + [HumanMessage(content=request.query)]
+                for chunk in main_llm.stream(messages):
+                    token = chunk.content
+                    final_answer_accumulator += token
+                    yield json.dumps({"type": "token", "content": token}) + "\n"
+
+            elif intent == "RAG":
                 target_filter = {"user_id": str(request.user_id)}
                 
-                # --- NEW: DYNAMIC SCOPE CONTROL ---
+                # --- DYNAMIC SCOPE CONTROL ---
                 if request.search_all_files:
-                    # Global Scope: Search everything the user has ever uploaded
                     user_docs = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": str(request.user_id)}).execute()
                     available_files = list(set([d["metadata"].get("file_name") for d in user_docs.data if d["metadata"].get("file_name")]))
                     
@@ -302,7 +346,6 @@ async def chat_endpoint(request: ChatRequest):
                                 target_filter["file_name"] = selected_file
                         except Exception: pass
                 else:
-                    # Session Scope: Restrict ONLY to files actively attached in this chat
                     if request.active_files:
                         if len(request.active_files) == 1:
                             target_filter["file_name"] = request.active_files[0]
@@ -364,7 +407,7 @@ async def chat_endpoint(request: ChatRequest):
                         
                     yield json.dumps({"type": "metadata", "intent": intent, "sources": sources_data}) + "\n"
                     context_text = "\n\n".join([f"Source: {d.metadata.get('file_name')} (Page {d.metadata.get('page')})\nText:\n{d.page_content}" for d, s in best_docs_scored])
-                    # REPLACED SYSTEM PROMPT
+                    
                     system_prompt = (
                         "You are an expert document analysis assistant. Answer the user's query using ONLY the provided context below. "
                         "Assume the user is the owner/subject of the documents. "
