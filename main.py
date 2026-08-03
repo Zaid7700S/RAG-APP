@@ -498,3 +498,11 @@ async def get_upload_status(user_id: str, file_name: str):
     """Allows frontend to poll the real-time background task status."""
     status = upload_statuses.get(f"{user_id}_{file_name}", "unknown")
     return {"status": status}
+
+@app.get("/health")
+async def health_check():
+    """
+    Lightweight health check endpoint for Render and UptimeRobot.
+    Returns a 200 OK status to keep the free-tier server awake.
+    """
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
