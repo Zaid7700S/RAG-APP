@@ -138,7 +138,7 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         doc = fitz.open(tmp_file_path)
         total_pages = len(doc)
         
-        # 1. Generate Summary from first 3 pages
+        # 1. Generate Summary
         preview_text = ""
         for i in range(min(3, total_pages)):
             if fast_mode == "true":
@@ -170,10 +170,13 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
         upload_timestamp = datetime.now().isoformat()
         chunk_counter = 1
         
+        # --- NEW: Global Chunk Buffer ---
+        chunk_buffer = []
+        BATCH_SIZE = 20
+        
         for page_num in range(total_pages):
             upload_statuses[task_id] = f"processing page {page_num + 1} of {total_pages}"
             
-            # --- DYNAMIC EXTRACTION ENGINE ---
             if fast_mode == "true":
                 page_md = doc[page_num].get_text("text")
             else:
@@ -189,9 +192,14 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
                 split.metadata["upload_date"] = upload_timestamp
                 chunk_counter += 1
             
-            BATCH_SIZE = 20  
-            for i in range(0, len(splits), BATCH_SIZE):
-                batch = splits[i : i + BATCH_SIZE]
+            # Add this page's chunks to the master buffer
+            chunk_buffer.extend(splits)
+            
+            # --- UPLOAD ONLY WHEN BUFFER IS FULL ---
+            while len(chunk_buffer) >= BATCH_SIZE:
+                batch = chunk_buffer[:BATCH_SIZE]
+                chunk_buffer = chunk_buffer[BATCH_SIZE:] # Remove uploaded chunks from buffer
+                
                 max_retries = 4
                 for attempt in range(max_retries):
                     try:
@@ -205,7 +213,6 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
                             time.sleep(sleep_time)
                         else:
                             raise Exception(f"API failed after {max_retries} attempts: {str(e)}")
-                del batch
             
             del page_md
             del page_doc
@@ -213,6 +220,24 @@ def process_pdf_background(tmp_file_path: str, file_name: str, user_id: str, hf_
             
             if page_num % 5 == 0 or page_num == total_pages - 1:
                 gc.collect()
+                
+        # --- FLUSH REMAINING CHUNKS ---
+        # Upload any leftover chunks after the final page is processed
+        if chunk_buffer:
+            upload_statuses[task_id] = "Finalizing upload..."
+            max_retries = 4
+            for attempt in range(max_retries):
+                try:
+                    vector_store.add_documents(chunk_buffer)
+                    break 
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "429" in error_str or "too many requests" in error_str or attempt < max_retries - 1:
+                        sleep_time = (2 ** attempt) * 2 
+                        time.sleep(sleep_time)
+                    else:
+                        raise Exception(f"API failed on final batch: {str(e)}")
+            chunk_buffer.clear()
         
         doc.close()
         upload_statuses[task_id] = "completed"
