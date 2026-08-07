@@ -418,7 +418,8 @@ async def chat_endpoint(request: ChatRequest):
                         "Assume the user is the owner/subject of the documents. "
                         "If the user asks a broad question (like 'what are my marks' or 'summarize'), provide a comprehensive breakdown of all relevant data found in the context. "
                         "If you only have partial data, provide what you have and explicitly state that it is a partial view based on the context. "
-                        "If the context contains Markdown tables, numbers, or academic grades, intelligently extract and format them.\n\n"
+                        "If the context contains Markdown tables, numbers, or academic grades, intelligently extract and format them.\n"
+                        "CRITICAL INSTRUCTION: DO NOT mention document names, filenames, or page numbers in your response text. The UI already displays sources separately below your message.\n\n"
                         f"Context:\n{context_text}\n\n"
                         "If absolutely NO relevant information can be found in the context to even partially answer the user, output exactly: 'I cannot answer this from the documents.'"
                     )
