@@ -456,20 +456,41 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/api/documents/{user_id}")
 async def get_user_documents(user_id: str):
-    if supabase_client is None: raise HTTPException(status_code=500, detail="Database not configured")
+    if supabase_client is None: 
+        raise HTTPException(status_code=500, detail="Database not configured")
     try:
-        summary_res = supabase_client.table("document_summaries").select("*").eq("user_id", user_id).execute()
-        summaries = {doc["file_name"]: doc for doc in summary_res.data}
-        chunk_res = supabase_client.table("documents").select("metadata").contains("metadata", {"user_id": user_id}).execute()
+        clean_user_id = str(user_id).strip()
+
+        # 1. Primary Source: Fetch from document_summaries table
+        summary_res = supabase_client.table("document_summaries").select("*").eq("user_id", clean_user_id).execute()
+        
+        # 2. Fallback Source: Fetch distinct documents from vector chunks
+        chunk_res = supabase_client.table("documents").select("metadata").filter("metadata->>user_id", "eq", clean_user_id).execute()
 
         final_docs = {}
+
+        # Load structured summaries first
+        for doc in summary_res.data:
+            fname = doc.get("file_name")
+            if fname:
+                final_docs[fname] = doc
+
+        # Load any missing documents directly from chunk metadata
         for row in chunk_res.data:
-            fname = row["metadata"].get("file_name")
+            meta = row.get("metadata", {})
+            fname = meta.get("file_name")
             if fname and fname not in final_docs:
-                if fname in summaries: final_docs[fname] = summaries[fname]
-                else: final_docs[fname] = {"id": fname, "file_name": fname, "title": fname, "summary": "Active in vector knowledge base.", "created_at": row["metadata"].get("upload_date", "Unknown")}
+                final_docs[fname] = {
+                    "id": fname,
+                    "file_name": fname,
+                    "title": meta.get("title", fname),
+                    "summary": "Active in vector knowledge base.",
+                    "created_at": meta.get("upload_date", "Unknown")
+                }
+
         return {"status": "success", "documents": list(final_docs.values())}
     except Exception as e:
+        print(f"❌ Error fetching user documents: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/documents/{user_id}/{file_name}")
